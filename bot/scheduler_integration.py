@@ -9,6 +9,7 @@ import pytz
 import os
 from datetime import datetime, timezone
 from threading import Thread
+import threading
 from typing import Optional
 
 from bot.database import BotDatabase
@@ -104,39 +105,53 @@ class LoggingEtsyMonitor:
         self.monitor = monitor
         self.logger = logger
         self.pending_logs = []
-    
+        self._log_lock = threading.Lock()
+
     def log_sync(self, message: str):
         """Добавляет запись в лог синхронно"""
         if self.logger:
-            # Сохраняем сообщение для последующей отправки
-            if not hasattr(self, 'pending_logs'):
-                self.pending_logs = []
-            
-            self.pending_logs.append(message)
+            with self._log_lock:
+                self.pending_logs.append(message)
             logging.info(f"LOG: {message}")  # Дублируем в обычные логи
     
     async def flush_logs(self):
-        """Отправляет все накопленные логи"""
-        if self.logger and hasattr(self, 'pending_logs'):
-            for log_message in self.pending_logs:
-                try:
-                    await self.logger.add_log_entry(log_message)
-                except Exception as e:
-                    logging.error(f"Ошибка отправки лога: {e}")
-            
-            self.pending_logs.clear()
+        """Отправляет накопленные логи в Telegram и чистит буфер."""
+        if not self.logger:
+            return
+
+        with self._log_lock:
+            batch, self.pending_logs = self.pending_logs, []
+
+        for log_message in batch:
+            try:
+                await self.logger.add_log_entry(log_message)
+            except Exception as e:
+                logging.error(f"Ошибка отправки лога: {e}")
     
     def run_monitoring_cycle_with_logging(self):
         """Запуск мониторинга с логированием без двойного парсинга"""
         try:
-            # Получаем ссылки из Google Sheets
+            # Получаем ссылки. data_service сам обрабатывает fallback на
+            # локальный кэш (output/shops_cache.json), если Google Sheets
+            # недоступен. Здесь мы только решаем, что делать с результатом.
             links = self.monitor.data_service.load_shop_urls()
-            
+
             if not links:
-                self.log_sync("❌ Не удалось получить ссылки из Google Sheets")
+                # Ни GSheets, ни локальный кэш не дали результата.
+                # Раньше здесь всегда был GSheets — теперь сообщение
+                # уточняет, что fallback тоже не сработал.
+                self.log_sync(
+                    "❌ Не удалось получить список магазинов: "
+                    "Google Sheets недоступен и локальный кэш пуст. "
+                    "Проверьте credentials.json / доступ к таблице. "
+                    "Парсинг пропущен."
+                )
                 return []
-            
-            self.log_sync(f"📋 Найдено {len(links)} магазинов в Google Sheets")
+
+            # Если load_shop_urls() отработал через fallback, в логах выше уже
+            # будет сообщение "♻️ Используем кэшированный список". Здесь просто
+            # сообщаем пользователю, сколько магазинов пошло в работу.
+            self.log_sync(f"📋 Найдено {len(links)} магазинов для парсинга")
             
             # Устанавливаем общее количество магазинов в логгере
             if self.logger:
@@ -268,7 +283,10 @@ class LoggingEtsyMonitor:
 
 class BotScheduler:
     """Планировщик с интеграцией Telegram бота"""
-    
+
+    # Как часто накопленные записи парсинга уходят в Telegram-лог.
+    LOG_FLUSH_INTERVAL = 5.0
+
     def __init__(self, notification_service: NotificationService, db: BotDatabase):
         self.notification_service = notification_service
         self.db = db
@@ -300,21 +318,15 @@ class BotScheduler:
         try:
             logging.info("Запуск парсинга с уведомлениями")
             
-            # Если есть user_id, создаем логгер для детального отслеживания
-            if user_id:
-                from bot.notifications import ParsingLogger
-                logger = ParsingLogger(self.notification_service, user_id)
-                await logger.start_logging()
-            else:
-                # Для автоматического парсинга отправляем простое уведомление всем
-                await self.notification_service.send_parsing_started_notification(user_id)
-            
+            # Живой лог нужен и при ручном, и при автоматическом запуске.
+            # При user_id=None ParsingLogger сам рассылает его всем админам —
+            # раньше автоматический прогон шёл вообще без лога.
+            from bot.notifications import ParsingLogger
+            logger = ParsingLogger(self.notification_service, user_id)
+            await logger.start_logging()
+
             # Запускаем мониторинг с логированием
-            if logger:
-                comparison_results = await self.run_monitoring_with_logging(logger)
-            else:
-                # Для автоматического запуска используем обычный монитор
-                comparison_results = self.monitor.run_monitoring_cycle()
+            comparison_results = await self.run_monitoring_with_logging(logger)
             
             # Собираем все новые товары
             all_new_products = []
@@ -327,34 +339,34 @@ class BotScheduler:
                 await self.notification_service.send_multiple_products_notification(all_new_products)
                 logging.info(f"Найдено и отправлено уведомлений о {len(all_new_products)} новых товарах")
             
-            # Завершаем логирование или отправляем уведомление
-            if logger:
-                await logger.finish_logging(len(all_new_products))
-            else:
-                await self.notification_service.send_parsing_completed_notification(len(all_new_products), user_id)
+            # Завершаем логирование — итог уходит в то же сообщение с логом
+            await logger.finish_logging(len(all_new_products))
             
             logging.info("Парсинг завершен успешно")
             
         except Exception as e:
             logging.error(f"Ошибка в парсинге: {e}")
-            
+
             # Уведомляем об ошибке
             try:
-                error_message = f"""❌ <b>Ошибка парсинга</b>
+                if logger:
+                    await logger.add_log_entry(f"❌ Ошибка: {str(e)[:100]}")
+                    # Лог мог не успеть обновиться — показываем итог сразу,
+                    # иначе статус парсинга останется неясным.
+                    await logger.finish_logging(0, failed=True)
+                else:
+                    error_message = f"""❌ <b>Ошибка парсинга</b>
 
 🚨 Ошибка: {str(e)[:200]}
 
 Проверьте логи для получения подробной информации."""
-                
-                if logger:
-                    await logger.add_log_entry(f"❌ Ошибка: {str(e)[:100]}")
-                elif user_id:
-                    await self.notification_service.send_message_to_user(user_id, error_message)
-                else:
-                    # Отправляем всем админам
-                    admins = await self.db.get_all_admins()
-                    for admin_id, _ in admins:
-                        await self.notification_service.send_message_to_user(admin_id, error_message)
+                    if user_id:
+                        await self.notification_service.send_message_to_user(user_id, error_message)
+                    else:
+                        # Отправляем всем админам
+                        admins = await self.db.get_all_admins()
+                        for admin_id, _ in admins:
+                            await self.notification_service.send_message_to_user(admin_id, error_message)
             except Exception:
                 pass
         finally:
@@ -379,28 +391,64 @@ class BotScheduler:
             raise e
     
     async def run_real_monitoring_with_logging(self, logger=None):
-        """Запуск реального мониторинга с логированием"""
+        """Запуск реального мониторинга с живым логом в Telegram.
+
+        Парсинг идёт в отдельном потоке и занимает минуты, поэтому event loop
+        бота НЕЛЬЗЯ блокировать на всё это время — иначе асинхронные задачи
+        (включая сам лог) не выполнятся, и пользователь увидит лог только
+        постфактум. Поэтому ждём результат через ``run_in_executor``, а лог
+        подливается фоновой задачей каждые несколько секунд.
+        """
+        custom_monitor = LoggingEtsyMonitor(self.monitor, logger)
+        flusher = None
+
+        async def flush_loop():
+            """Периодически отправляет накопленные записи лога."""
+            while True:
+                await asyncio.sleep(self.LOG_FLUSH_INTERVAL)
+                try:
+                    await custom_monitor.flush_logs()
+                    if logger:
+                        # Гарантируем, что неотправленные изменения уедут
+                        # даже если троттлинг не дал обновить сообщение.
+                        await logger.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logging.error(f"Ошибка фоновой отправки лога: {e}")
+
         try:
-            # Создаем кастомный монитор с логированием
-            custom_monitor = LoggingEtsyMonitor(self.monitor, logger)
-            
-            # Запускаем мониторинг с логированием в отдельном потоке
+            loop = asyncio.get_running_loop()
             import concurrent.futures
-            
-            with concurrent.futures.ThreadPoolExecutor() as executor:
+
+            if logger:
+                flusher = asyncio.create_task(flush_loop())
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(custom_monitor.run_monitoring_cycle_with_logging)
-                comparison_results = future.result()
-            
-            # Отправляем накопленные логи
+                # await, а не future.result(): event loop остаётся свободным.
+                # Отдельный executor для ожидания: не зависим от того, занят
+                # ли чужой пул потоков бота.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as waiter:
+                    comparison_results = await loop.run_in_executor(waiter, future.result)
+
+            # Отправляем всё, что осталось в буфере
             await custom_monitor.flush_logs()
-            
+
             return comparison_results
-            
+
         except Exception as e:
             logging.error(f"Ошибка в реальном мониторинге: {e}")
             if logger:
                 await logger.add_log_entry(f"❌ Ошибка мониторинга: {str(e)[:100]}")
             return []
+        finally:
+            if flusher:
+                flusher.cancel()
+                try:
+                    await flusher
+                except (asyncio.CancelledError, Exception):
+                    pass
     
     def extract_shop_name(self, url: str) -> str:
         """Извлекает название магазина из URL"""
@@ -415,21 +463,29 @@ class BotScheduler:
 
     
     def _schedule_job_wrapper(self):
-        """Обертка для запуска асинхронной задачи в синхронном планировщике"""
+        """Обертка для запуска асинхронной задачи в синхронном планировщике.
+
+        Планировщик schedule работает в отдельном потоке, поэтому асинхронную
+        задачу нужно отправлять в основной event loop бота через
+        ``asyncio.run_coroutine_threadsafe``. Создавать НОВЫЙ event loop здесь
+        нельзя: внутренний aiohttp-сессия aiogram ``Bot`` привязана к loop'у,
+        в котором бот был запущен. Попытка вызвать ``bot.send_message`` из
+        другого loop приводит к ``RuntimeError: Event loop is closed``.
+        """
         try:
             if self.main_loop and not self.main_loop.is_closed():
                 # Используем основной event loop бота
-                future = asyncio.run_coroutine_threadsafe(self.scheduled_parsing_job(), self.main_loop)
+                future = asyncio.run_coroutine_threadsafe(
+                    self.scheduled_parsing_job(), self.main_loop
+                )
                 future.result()  # Ждем завершения
             else:
-                # Фолбэк: создаем новый event loop
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(self.scheduled_parsing_job())
-                finally:
-                    loop.close()
-            
+                logging.error(
+                    "Планировщик не может запустить задачу парсинга: "
+                    "основной event loop бота недоступен или закрыт. "
+                    "Пропускаю запуск до следующего цикла."
+                )
+
         except Exception as e:
             logging.error(f"Ошибка в обертке планировщика: {e}")
     
@@ -437,11 +493,17 @@ class BotScheduler:
         """Обновление расписания с умным расчетом времени"""
         try:
             schedule.clear()
-            
+
             schedule_time, schedule_day = await self.db.get_scheduler_settings()
             moscow_time = datetime.now(self.moscow_tz)
             current_weekday = moscow_time.strftime('%A').lower()
-            
+
+            # Конвертируем «МСК день + время» → «локальное время системы».
+            # Без этого .monday.at("08:00") сработает в 08:00 ЛОКАЛЬНО,
+            # что на сервере с TZ != Europe/Moscow ≠ 08:00 МСК.
+            from utils.moscow_schedule import moscow_to_local_fire
+            local_day, local_hhmm = moscow_to_local_fire(schedule_time, schedule_day)
+
             day_mapping = {
                 "monday": schedule.every().monday,
                 "tuesday": schedule.every().tuesday,
@@ -451,44 +513,50 @@ class BotScheduler:
                 "saturday": schedule.every().saturday,
                 "sunday": schedule.every().sunday
             }
-            
-            if schedule_day in day_mapping:
-                # Всегда создаем еженедельное расписание
-                day_mapping[schedule_day].at(schedule_time).do(self._schedule_job_wrapper)
-                
-                # Если сегодня тот же день и время еще не прошло - создаем отдельную задачу на сегодня
+
+            if local_day in day_mapping:
+                # Еженедельное расписание в локальном времени, соответствующее
+                # выбранному московскому HH:MM и дню недели.
+                day_mapping[local_day].at(local_hhmm).do(self._schedule_job_wrapper)
+
+                # Если сегодня тот же день и время еще не прошло — отдельная задача на сегодня.
                 if current_weekday == schedule_day:
                     schedule_hour, schedule_minute = map(int, schedule_time.split(':'))
                     schedule_datetime = moscow_time.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
-                    
+
                     if moscow_time < schedule_datetime:
-                        # Вычисляем через сколько минут запуск
                         minutes_until = int((schedule_datetime - moscow_time).total_seconds() / 60)
-                        
-                        # Создаем одноразовую задачу на сегодня (в локальном времени системы)
-                        local_time = datetime.now()
-                        time_diff = schedule_datetime - moscow_time
-                        local_schedule_time = local_time + time_diff
-                        local_time_str = local_schedule_time.strftime('%H:%M')
-                        
-                        schedule.every().day.at(local_time_str).do(self._schedule_job_wrapper).tag('today')
-                        
-                        logging.info(f"Запуск СЕГОДНЯ в {schedule_time} МСК (через {minutes_until} мин) + еженедельно")
+
+                        # Та же конвертация для одноразовой задачи — иначе будет дрейф.
+                        _, today_local_hhmm = moscow_to_local_fire(schedule_time, schedule_day)
+                        schedule.every().day.at(today_local_hhmm).do(self._schedule_job_wrapper).tag('today')
+
+                        logging.info(
+                            f"Запуск СЕГОДНЯ в {schedule_time} МСК "
+                            f"(через {minutes_until} мин, локально {today_local_hhmm}) "
+                            f"+ еженедельно {schedule_day} {schedule_time} МСК"
+                        )
                     else:
-                        logging.info(f"Еженедельный запуск: каждый {schedule_day} в {schedule_time} МСК")
+                        logging.info(
+                            f"Еженедельный запуск: каждый {schedule_day} в {schedule_time} МСК "
+                            f"(локально {local_day} {local_hhmm})"
+                        )
                 else:
-                    logging.info(f"Еженедельный запуск: каждый {schedule_day} в {schedule_time} МСК")
-                
+                    logging.info(
+                        f"Еженедельный запуск: каждый {schedule_day} в {schedule_time} МСК "
+                        f"(локально {local_day} {local_hhmm})"
+                    )
+
                 logging.info(f"Текущее время МСК: {moscow_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                
+
                 if schedule.jobs:
                     next_run = schedule.next_run()
                     logging.info(f"Следующий запуск: {next_run}")
             else:
                 logging.error(f"Неизвестный день недели: {schedule_day}")
-                
+
         except Exception as e:
-            logging.error(f"Ошибка обновления расписания: {e}")
+            logging.error(f"Ошибка обновления расписания: {e}", exc_info=True)
     
     def _scheduler_loop(self):
         """Основной цикл планировщика"""

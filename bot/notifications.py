@@ -3,113 +3,378 @@
 """
 import asyncio
 import logging
+import time
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 from bot.database import BotDatabase
 from models.product import Product
 
+
+def _esc(text: str) -> str:
+    """Экранирование текста для HTML parse mode."""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 class ParsingLogger:
-    """Класс для управления логами парсинга в реальном времени"""
-    
-    def __init__(self, notification_service, user_id: int):
+    """Живой лог парсинга в Telegram (по подходу веб-логов).
+
+    Принцип отображения: подробные записи об успехе НЕ выводятся — за прогон их
+    бывают сотни, а Telegram позволяет держать лог в одном сообщении (лимит
+    ~4096 символов). Показываются только ПРОБЛЕМЫ (❌/⚠️/🛑) плюс сводный
+    прогресс и итог. Благодаря этому статус парсинга виден целиком, а не
+    «последние 78 строк».
+
+    Ограничения Telegram соблюдаются так:
+    * основное сообщение одно и редактируется;
+    * проблемы втискиваются по бюджету символов, а не по числу строк;
+    * не поместившиеся проблемы уходят отдельным сообщением в финале —
+      ни один проблемный магазин не пропадает молча;
+    * правки throttled по времени — чтобы не словить flood control.
+
+    ``user_id=None`` означает автоматический запуск по расписанию: лог
+    рассылается всем администраторам (как и раньше делали стартовые/финальные
+    уведомления).
+    """
+
+    ERROR_MARKERS = ("❌", "⚠️", "🛑")
+
+    def __init__(self, notification_service, user_id: Optional[int] = None):
         self.notification_service = notification_service
         self.user_id = user_id
-        self.log_message = None
-        self.log_entries = []
+        self.recipients: List[int] = []
+        self.log_messages = {}  # recipient -> Message
+        self.log_entries = []   # полный список событий (не показывается)
+        self.errors = []        # полный список проблем (никогда не обрезается)
+        self._shown_count = 0  # сколько проблем показано в последнем тексте
+        self.ok_count = 0       # сколько успешных шагов прошло
+
         self.max_message_length = 4000
-        self.update_count = 0
-        self.max_updates = 5  # Максимум 5 обновлений сообщения
+        # Равный интервалу флаша в scheduler: одна правка на тик, без потока
+        # правок в Telegram (flood control) и без «мерцания» прогресса.
+        self.min_update_interval = 5.0   # не чаще раза в 5 сек
+        self.error_min_interval = 2.0    # для ошибок — не чаще раза в 2 сек
+
         self.total_shops = 0
         self.current_shop = 0
-        
+        self.new_products = 0
+        self.stopped = False
+
+        self._dirty = False
+        self._shown_errors = 0
+        self._last_update_at = 0.0
+        self._started_at: Optional[float] = None
+        self._final_line: Optional[str] = None
+        self._finished = False
+
+    # ------------------------------------------------------------------ setup
+
     async def start_logging(self):
-        """Начинаем логирование - отправляем первое сообщение"""
-        initial_text = "🚀 <b>Запуск парсинга</b>\n\n📋 <b>Лог процесса:</b>\n\n⏳ Инициализация..."
-        
-        self.log_message = await self.notification_service.send_message_to_user(
-            self.user_id, initial_text
-        )
-        
-        if self.log_message:
-            self.log_entries.append("⏳ Инициализация...")
-    
-    def set_total_shops(self, total: int):
-        """Устанавливаем общее количество магазинов"""
-        self.total_shops = total
-    
-    async def add_log_entry(self, entry: str):
-        """Добавляем новую запись в лог с ограничением обновлений"""
-        if not self.log_message:
-            return
-            
-        self.log_entries.append(entry)
-        
-        # Определяем, нужно ли обновлять сообщение
-        should_update = False
-        
-        if self.update_count < self.max_updates:
-            # Обновляем на ключевых этапах
-            if ("📋 Найдено" in entry or 
-                "🔍 Анализируем" in entry or 
-                "🎉 Найдено" in entry or 
-                "🧹 Очистка" in entry or
-                "❌" in entry or
-                "🛑" in entry):
-                should_update = True
-            
-            # Или каждые 20% прогресса парсинга магазинов
-            elif "🔄" in entry and self.total_shops > 0:
-                self.current_shop += 1
-                progress_percent = (self.current_shop / self.total_shops) * 100
-                if progress_percent >= (self.update_count + 1) * 20:
-                    should_update = True
-        
-        if should_update:
-            await self._update_message()
-            self.update_count += 1
-    
-    async def _update_message(self):
-        """Обновляем сообщение в Telegram"""
-        new_text = "🚀 <b>Запуск парсинга</b>\n\n📋 <b>Лог процесса:</b>\n\n"
-        
-        # Добавляем записи, следя за лимитом длины
-        temp_entries = []
-        temp_length = len(new_text)
-        
-        # Идем с конца, чтобы показать самые свежие записи
-        for entry in reversed(self.log_entries):
-            entry_length = len(entry) + 1
-            if temp_length + entry_length > self.max_message_length:
-                break
-            temp_entries.insert(0, entry)
-            temp_length += entry_length
-        
-        # Если не все записи поместились, добавляем индикатор
-        if len(temp_entries) < len(self.log_entries):
-            new_text += "...\n"
-        
-        new_text += "\n".join(temp_entries)
-        
-        # Обновляем сообщение с задержкой для избежания flood control
-        import asyncio
-        await asyncio.sleep(1)
-        await self.notification_service.edit_message(
-            self.user_id, 
-            self.log_message.message_id, 
-            new_text
-        )
-    
-    async def finish_logging(self, total_new_products: int):
-        """Завершаем логирование"""
-        if total_new_products > 0:
-            final_entry = f"✅ <b>Парсинг завершен!</b> Найдено {total_new_products} новых товаров"
+        """Отправляет первое сообщение всем получателям."""
+        self._started_at = time.monotonic()
+        text = self._build_text()
+        sent = []
+
+        if self.user_id:
+            candidates = [self.user_id]
         else:
-            final_entry = "✅ <b>Парсинг завершен!</b> Новых товаров не найдено"
-            
-        await self.add_log_entry(final_entry)
+            # Автоматический запуск: лог получают все админы.
+            try:
+                admins = await self.notification_service.db.get_all_admins()
+            except Exception as e:
+                logging.error(f"Не удалось получить список админов для лога: {e}")
+                admins = []
+            # db отдаёт список кортежей (id, имя); терпим и просто id.
+            candidates = [
+                admin[0] if isinstance(admin, (tuple, list)) else admin
+                for admin in (admins or [])
+            ]
+
+        for recipient in candidates:
+            try:
+                message = await self.notification_service.send_message_to_user(
+                    recipient, text
+                )
+                if message:
+                    self.log_messages[recipient] = message
+                    sent.append(recipient)
+            except Exception as e:
+                logging.error(f"Не удалось отправить лог парсинга {recipient}: {e}")
+
+        self.recipients = sent
+        if sent:
+            self.log_entries.append("⏳ Инициализация...")
+        else:
+            logging.warning(
+                "Лог парсинга не отправлен ни одному получателю "
+                "(парсинг продолжится без визуального лога)"
+            )
+        return sent
+
+    def set_total_shops(self, total: int):
+        self.total_shops = total
+        self.current_shop = 0
+        self._dirty = True
+
+    # ----------------------------------------------------------------- events
+
+    async def add_log_entry(self, entry: str):
+        """Добавляет событие в лог и обновляет сообщение (с троттлингом)."""
+        if not self.log_messages:
+            return
+
+        self.log_entries.append(entry)
+
+        if entry.startswith("🔄 [") and self.total_shops > 0:
+            # Прогресс по магазинам: «🔄 [7/45] Парсим: ShopName»
+            self.current_shop = min(self.current_shop + 1, self.total_shops)
+            self._dirty = True
+        elif any(marker in entry for marker in self.ERROR_MARKERS):
+            if "🛑" in entry:
+                self.stopped = True
+            self.errors.append(entry)
+            self._dirty = True
+            await self._maybe_update()
+            return
+        else:
+            if entry.startswith("✅"):
+                self.ok_count += 1
+            elif entry.startswith("🎉"):
+                try:
+                    self.new_products = int(
+                        entry.split("Найдено")[1].split("новых")[0].strip()
+                    )
+                except (IndexError, ValueError):
+                    pass
+            if "📋 Найдено" in entry or "🎉" in entry or "🧹" in entry:
+                self._dirty = True
+
+        await self._maybe_update()
+
+    async def mark_stopped(self):
+        """Парсинг остановлен принудительно."""
+        self.stopped = True
+        await self.add_log_entry("🛑 Парсинг остановлен принудительно")
+
+    async def tick(self):
+        """Форсирует обновление, если накопились неотправленные изменения.
+
+        Вызывается планировщиком по таймеру — гарантирует, что запись не
+        потеряется только из-за троттлинга.
+        """
+        await self._maybe_update()
+
+    async def _maybe_update(self):
+        """Обновляет сообщение, если прошёл нужный интервал."""
+        if not self._dirty or not self.log_messages:
+            return
+
+        now = time.monotonic()
+        since_last = now - self._last_update_at
+
+        # Новые проблемы показываем быстрее, прогресс — не чаще раза в 10 сек.
+        has_new_errors = len(self.errors) > self._shown_errors
+        interval = self.error_min_interval if has_new_errors else self.min_update_interval
+
+        if since_last < interval:
+            return
+
+        await self._update_message()
+
+    # --------------------------------------------------------------- rendering
+
+    def _top_lines(self) -> List[str]:
+        if self.stopped:
+            header = "🛑 <b>Парсинг Etsy</b>"
+        elif self._finished:
+            header = "🏁 <b>Парсинг Etsy — завершён</b>"
+        else:
+            header = "🔄 <b>Парсинг Etsy</b>"
+        return [
+            header,
+            "",
+            f"📊 {_esc(self._progress_text())}",
+            f"⏱ {_esc(self._time_text())}",
+            "",
+        ]
+
+    def _bottom_lines(self) -> List[str]:
+        lines = []
+        if self._final_line:
+            lines += [self._final_line, ""]
+        lines.append(
+            f"ℹ️ Успешных шагов: {self.ok_count} · "
+            f"всего событий: {len(self.log_entries)} · "
+            f"в логе только проблемы"
+        )
+        return lines
+
+    def _render(self) -> str:
+        """Собирает текст, втискивая проблемы ВСЕ, что влезают в лимит.
+
+        Ограничение — по символам, а не по числу строк: 60 проблем средней
+        длины спокойно влезают в сообщение Telegram, обрезать их на 25 было
+        бы бессмысленно. Что не влезло — уходит в продолжение в финале.
+
+        ``self.errors`` тут НЕ изменяется: полный список нужен, чтобы
+        отправить не поместившееся в продолжении. Поэтому подбор идёт строго
+        по бюджету символов, а не «обрезаем, пока не влезло».
+        """
+        top = self._top_lines()
+        bottom = self._bottom_lines()
+
+        budget = (
+            self.max_message_length
+            - sum(len(line) + 1 for line in top)
+            - sum(len(line) + 1 for line in bottom)
+            - len("⚠️ <b>Проблемы (999)</b>") - 60  # запас на заголовок
+        )
+
+        shown = []
+        used = 0
+        for error in reversed(self.errors):
+            cost = len(_esc(error)) + 3  # "• " + перевод строки
+            if used + cost > budget:
+                break
+            shown.insert(0, error)
+            used += cost
+        self._shown_count = len(shown)
+
+        total_errors = len(self.errors)
+        hidden = total_errors - len(shown)
+
+        lines = list(top)
+        if shown:
+            lines.append(f"⚠️ <b>Проблемы ({total_errors})</b>")
+            lines += [f"• {_esc(error)}" for error in shown]
+            if hidden > 0:
+                lines.append(f"• …и ещё {hidden} — в сообщении ниже")
+            lines.append("")
+        else:
+            lines += ["✅ Проблем нет", ""]
+
+        lines += bottom
+        return "\n".join(lines)
+
+    def _build_text(self) -> str:
+        return self._render()
+
+    def _progress_text(self) -> str:
+        if self.total_shops:
+            shops = f"{self.current_shop}/{self.total_shops} магазинов"
+        else:
+            shops = "магазины не определены"
+        return f"{shops} · новых товаров: {self.new_products}"
+
+    def _time_text(self) -> str:
+        now = datetime.now().strftime("%H:%M")
+        if self._started_at is None:
+            return now
+        elapsed = int(time.monotonic() - self._started_at)
+        if elapsed < 60:
+            return f"{now} · идёт {elapsed} сек"
+        return f"{now} · идёт {elapsed // 60} мин"
+
+    async def _update_message(self):
+        text = self._build_text()
+        self._dirty = False
+        self._shown_errors = len(self.errors)
+        self._last_update_at = time.monotonic()
+
+        for recipient, message in self.log_messages.items():
+            try:
+                await self.notification_service.edit_message(
+                    recipient, message.message_id, text
+                )
+            except Exception as e:
+                logging.error(f"Не удалось обновить лог парсинга {recipient}: {e}")
+
+    async def finish_logging(self, total_new_products: int, failed: bool = False):
+        """Финальная строка + гарантированная отправка итогового статуса.
+
+        ``failed=True`` — прогон упал до конца, «новых товаров не найдено»
+        здесь было бы враньём, поэтому статус другой.
+        """
+        self.new_products = total_new_products
+        self._finished = True
+
+        if failed:
+            self._final_line = "❌ <b>Парсинг завершился с ошибкой</b>"
+        elif total_new_products > 0:
+            self._final_line = (
+                f"✅ <b>Парсинг завершён!</b> Найдено {total_new_products} "
+                f"новых товаров"
+            )
+        elif self.stopped:
+            self._final_line = "🛑 <b>Парсинг прерван</b> пользователем"
+        else:
+            self._final_line = "✅ <b>Парсинг завершён!</b> Новых товаров не найдено"
+
+        self._dirty = True
+
+        # Финальный статус обязан быть виден: обновление здесь принудительное.
+        if self.log_messages:
+            await self._update_message()
+            await self._send_remaining_problems()
+
+    async def _send_remaining_problems(self):
+        """Отправляет проблемы, которые не влезли в основное сообщение.
+
+        Ограничение Telegram — 4096 символов на сообщение. Основное сообщение
+        лога заполняется по этому бюджету, и если проблем больше, чем в него
+        поместилось, недостающие уходят отдельными сообщениями. Иначе часть
+        магазинов с проблемами была бы не видна вообще — ровно то, что
+        чинили.
+        """
+        if not self.log_messages:
+            return
+
+        shown = getattr(self, "_shown_count", 0)
+        remaining = self.errors[: len(self.errors) - shown] if shown else list(self.errors)
+        if not remaining:
+            return
+
+        chunks = []
+        current = []
+        used = 0
+        # Заголовок с местом под номер: закладываем 60 символов.
+        for error in remaining:
+            cost = len(_esc(error)) + 3
+            if used + cost > self.max_message_length - 60:
+                chunks.append(current)
+                current, used = [], 0
+            current.append(error)
+            used += cost
+        if current:
+            chunks.append(current)
+
+        for index, chunk in enumerate(chunks, 1):
+            header = (
+                f"⚠️ <b>Проблемы — продолжение "
+                f"({index}/{len(chunks)})</b>\n\n"
+                f"В основном логе показаны последние {shown}. "
+                f"Здесь первые {len(remaining)}."
+            )
+            body = "\n".join(f"• {_esc(error)}" for error in chunk)
+            text = f"{header}\n\n{body}"
+
+            for recipient in self.recipients:
+                try:
+                    await self.notification_service.send_message_to_user(
+                        recipient, text
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"Не удалось отправить продолжение лога {recipient}: {e}"
+                    )
+                await asyncio.sleep(0.3)
 
 class NotificationService:
     """Сервис для отправки уведомлений о новых товарах"""
