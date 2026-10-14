@@ -139,18 +139,27 @@ class AnalyticsScheduler:
                 pass
     
     def _schedule_job_wrapper(self):
-        """Обертка для запуска асинхронной задачи в синхронном планировщике"""
+        """Обертка для запуска асинхронной задачи в синхронном планировщике.
+
+        Планировщик schedule работает в отдельном потоке, поэтому асинхронную
+        задачу нужно отправлять в основной event loop бота через
+        ``asyncio.run_coroutine_threadsafe``. Создавать НОВЫЙ event loop здесь
+        нельзя: внутренний aiohttp-сессия aiogram ``Bot`` привязана к loop'у,
+        в котором бот был запущен. Попытка вызвать ``bot.send_message`` из
+        другого loop приводит к ``RuntimeError: Event loop is closed``.
+        """
         try:
             if self.main_loop and not self.main_loop.is_closed():
-                future = asyncio.run_coroutine_threadsafe(self.scheduled_analytics_job(), self.main_loop)
+                future = asyncio.run_coroutine_threadsafe(
+                    self.scheduled_analytics_job(), self.main_loop
+                )
                 future.result()
             else:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(self.scheduled_analytics_job())
-                finally:
-                    loop.close()
+                logging.error(
+                    "[АНАЛИТИКА] Планировщик не может запустить задачу: "
+                    "основной event loop бота недоступен или закрыт. "
+                    "Пропускаю запуск до следующего цикла."
+                )
         except Exception as e:
             logging.error(f"Ошибка в обертке планировщика аналитики: {e}")
     
@@ -159,14 +168,17 @@ class AnalyticsScheduler:
         try:
             schedule.clear('analytics')
             schedule.clear('analytics_today')
-            
+
             schedule_time, schedule_day = await self.db.get_analytics_scheduler_settings()
             logging.info(f"[АНАЛИТИКА] Настройки из БД: {schedule_day} в {schedule_time}")
-            
+
             moscow_time = datetime.now(self.moscow_tz)
             current_weekday = moscow_time.strftime('%A').lower()
             logging.info(f"[АНАЛИТИКА] Текущее время МСК: {moscow_time.strftime('%Y-%m-%d %H:%M:%S')} ({current_weekday})")
-            
+
+            # Конвертируем «МСК день + время» → «локальное время системы».
+            from utils.moscow_schedule import moscow_to_local_fire
+
             day_mapping = {
                 "monday": schedule.every().monday,
                 "tuesday": schedule.every().tuesday,
@@ -176,39 +188,55 @@ class AnalyticsScheduler:
                 "saturday": schedule.every().saturday,
                 "sunday": schedule.every().sunday
             }
-            
-            if schedule_day in day_mapping:
-                day_mapping[schedule_day].at(schedule_time).do(self._schedule_job_wrapper).tag('analytics')
-                logging.info(f"[АНАЛИТИКА] Создана еженедельная задача: {schedule_day} в {schedule_time}")
-                
-                if current_weekday == schedule_day:
-                    schedule_hour, schedule_minute = map(int, schedule_time.split(':'))
-                    schedule_datetime = moscow_time.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
-                    
-                    if moscow_time < schedule_datetime:
-                        minutes_until = int((schedule_datetime - moscow_time).total_seconds() / 60)
-                        
-                        local_time = datetime.now()
-                        time_diff = schedule_datetime - moscow_time
-                        local_schedule_time = local_time + time_diff
-                        local_time_str = local_schedule_time.strftime('%H:%M')
-                        
-                        schedule.every().day.at(local_time_str).do(self._schedule_job_wrapper).tag('analytics_today')
-                        
-                        logging.info(f"[АНАЛИТИКА] Запуск СЕГОДНЯ в {schedule_time} МСК (через {minutes_until} мин) + еженедельно")
-                    else:
-                        logging.info(f"[АНАЛИТИКА] Еженедельная аналитика: каждый {schedule_day} в {schedule_time} МСК")
-                else:
-                    logging.info(f"[АНАЛИТИКА] Еженедельная аналитика: каждый {schedule_day} в {schedule_time} МСК")
-                
-                analytics_jobs = [job for job in schedule.jobs if 'analytics' in job.tags]
-                logging.info(f"[АНАЛИТИКА] Всего задач аналитики в schedule: {len(analytics_jobs)}")
-                if analytics_jobs:
-                    for job in analytics_jobs:
-                        logging.info(f"[АНАЛИТИКА] Задача: {job.tags}, следующий запуск: {job.next_run}")
-            else:
-                logging.error(f"[АНАЛИТИКА] Неизвестный день недели: {schedule_day}")
-                
+
+            # Несколько дней через запятую: "tuesday,friday".
+            days = [d.strip().lower() for d in str(schedule_day).split(',') if d.strip()]
+            if not days:
+                logging.error("[АНАЛИТИКА] Не выбран ни один день недели")
+                return
+
+            created = []
+            for day in days:
+                local_day, local_hhmm = moscow_to_local_fire(schedule_time, day)
+                if local_day not in day_mapping:
+                    logging.error(f"[АНАЛИТИКА] Неизвестный день недели: {day}")
+                    continue
+                day_mapping[local_day].at(local_hhmm).do(self._schedule_job_wrapper).tag('analytics')
+                created.append(f"{day} {local_hhmm}")
+
+            if not created:
+                logging.error(f"[АНАЛИТИКА] Не удалось создать задачи по дням: {days}")
+                return
+
+            logging.info(
+                f"[АНАЛИТИКА] Еженедельный запуск ({len(created)} дн.): "
+                f"{', '.join(days)} в {schedule_time} МСК (локально: {', '.join(created)})"
+            )
+
+            # Одноразовая задача на сегодня — не больше одной.
+            if current_weekday in days:
+                schedule_hour, schedule_minute = map(int, schedule_time.split(':'))
+                schedule_datetime = moscow_time.replace(
+                    hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0
+                )
+
+                if moscow_time < schedule_datetime:
+                    minutes_until = int((schedule_datetime - moscow_time).total_seconds() / 60)
+
+                    _, today_local_hhmm = moscow_to_local_fire(schedule_time, current_weekday)
+                    schedule.every().day.at(today_local_hhmm).do(self._schedule_job_wrapper).tag('analytics_today')
+
+                    logging.info(
+                        f"[АНАЛИТИКА] Запуск СЕГОДНЯ в {schedule_time} МСК "
+                        f"(через {minutes_until} мин, локально {today_local_hhmm}) "
+                        f"+ еженедельно: {', '.join(days)}"
+                    )
+
+            analytics_jobs = [job for job in schedule.jobs if 'analytics' in job.tags]
+            logging.info(f"[АНАЛИТИКА] Всего задач аналитики в schedule: {len(analytics_jobs)}")
+            for job in analytics_jobs:
+                logging.info(f"[АНАЛИТИКА] Задача: {job.tags}, следующий запуск: {job.next_run}")
+
         except Exception as e:
             logging.error(f"[АНАЛИТИКА] Ошибка обновления расписания: {e}", exc_info=True)
     

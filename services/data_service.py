@@ -444,22 +444,106 @@ class DataService:
             logging.error(f"Ошибка очистки: {e}")
             return False
     
+    # Путь к локальному кэшу URL магазинов. Используется как fallback, когда
+    # Google Sheets недоступен (network error, invalid_grant JWT, квота и т.п.)
+    # — чтобы парсинг не останавливался из-за временной проблемы с GSheets.
+    SHOPS_CACHE_FILENAME = "shops_cache.json"
+    SHOPS_CACHE_STALE_DAYS = 7  # старше этого срока считаем кэш устаревшим
+
+    def _shops_cache_path(self) -> str:
+        return os.path.join(self.output_dir, self.SHOPS_CACHE_FILENAME)
+
+    def _save_shops_cache(self, urls: List[str]) -> None:
+        """Сохраняет список URL в локальный JSON-кэш."""
+        try:
+            cache_path = self._shops_cache_path()
+            payload = {
+                "urls": urls,
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "count": len(urls),
+            }
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            logging.info(f"💾 Кэш магазинов сохранён: {cache_path} ({len(urls)} URL)")
+        except Exception as e:
+            logging.warning(f"⚠️ Не удалось сохранить кэш магазинов: {e}")
+
+    def _load_shops_cache(self) -> List[str]:
+        """
+        Читает URL из локального кэша. Возвращает [] если файла нет,
+        он повреждён или сильно устарел (>SHOPS_CACHE_STALE_DAYS дней).
+        """
+        cache_path = self._shops_cache_path()
+        if not os.path.exists(cache_path):
+            return []
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            urls = payload.get("urls") or []
+            saved_at = payload.get("saved_at")
+            if not urls:
+                return []
+            age_days = None
+            if saved_at:
+                try:
+                    saved_dt = datetime.fromisoformat(saved_at)
+                    age_days = (datetime.now() - saved_dt).days
+                except Exception:
+                    pass
+            if age_days is not None and age_days > self.SHOPS_CACHE_STALE_DAYS:
+                logging.warning(
+                    f"⚠️ Кэш магазинов устарел ({age_days} дн., "
+                    f"лимит {self.SHOPS_CACHE_STALE_DAYS} дн.). "
+                    f"Всё равно используем — лучше парсить по старым URL, чем ничего."
+                )
+            else:
+                age_str = f"{age_days} дн." if age_days is not None else "возраст неизвестен"
+                logging.info(f"📂 Кэш магазинов загружен: {len(urls)} URL (возраст: {age_str})")
+            return urls
+        except Exception as e:
+            logging.warning(f"⚠️ Не удалось прочитать кэш магазинов: {e}")
+            return []
+
     def load_shop_urls(self) -> List[str]:
-        """Загружает список URL магазинов из Google Sheets"""
+        """
+        Загружает список URL магазинов.
+
+        Стратегия:
+          1. Сначала пробуем Google Sheets (актуальные данные).
+          2. Если успех → сохраняем в локальный кэш и возвращаем.
+          3. Если GSheets упал (network, auth, квота) → читаем кэш.
+          4. Если и кэша нет → возвращаем [] (парсер залогирует это
+             и решит, как действовать дальше — см. BotScheduler.run_monitoring_cycle_with_logging).
+        """
         if hasattr(self.config, 'google_sheets_enabled') and self.config.google_sheets_enabled:
             try:
                 from services.google_sheets_service import GoogleSheetsService
                 sheets_service = GoogleSheetsService(self.config)
-                
+
                 if sheets_service.enabled:
                     urls = sheets_service.load_shop_urls_from_sheets(
                         self.config.google_sheets_spreadsheet_id,
                         "Etsy Shops"
                     )
                     if urls:
-                        print(f"📊 Загружено {len(urls)} URL из Google Sheets")
+                        logging.info(f"📊 Загружено {len(urls)} URL из Google Sheets")
+                        self._save_shops_cache(urls)  # обновляем кэш на каждый успех
                         return urls
+                    else:
+                        logging.warning("⚠️ Google Sheets вернул пустой список магазинов")
             except Exception as e:
-                print(f"⚠️ Ошибка Google Sheets: {e}")
-        
+                logging.warning(f"⚠️ Ошибка Google Sheets: {e}")
+        else:
+            logging.info("ℹ️ Google Sheets отключён в конфиге, используем локальный кэш")
+
+        # Fallback: локальный кэш
+        cached_urls = self._load_shops_cache()
+        if cached_urls:
+            logging.info(
+                f"♻️ Используем кэшированный список магазинов "
+                f"({len(cached_urls)} URL) — Google Sheets недоступен"
+            )
+            return cached_urls
+
+        logging.warning("❌ Нет ни Google Sheets, ни локального кэша магазинов")
         return []

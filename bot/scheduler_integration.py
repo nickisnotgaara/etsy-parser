@@ -106,6 +106,12 @@ class LoggingEtsyMonitor:
         self.logger = logger
         self.pending_logs = []
         self._log_lock = threading.Lock()
+        # Счётчики для честного итога: «магазинов нет» и «магазины не
+        # проверились» — разные вещи и должны выглядеть по-разному.
+        self.checked_shops = 0
+        self.failed_shops = 0
+        # (магазин, url, причина) — для отдельного сообщения со ссылками.
+        self.failed_details = []
 
     def log_sync(self, message: str):
         """Добавляет запись в лог синхронно"""
@@ -162,6 +168,11 @@ class LoggingEtsyMonitor:
             
             # Парсим все магазины с логированием
             all_shop_products = self.parse_all_shops_with_logging(links)
+
+            # Отдельный список сломанных магазинов со ссылками — уходит
+            # отдельным сообщением в финале, а не теряется в логе.
+            if self.logger is not None and self.failed_details:
+                self.logger.set_failed_shops(self.failed_details)
             
             # Проверяем, не был ли парсинг остановлен принудительно
             from config.settings import is_parser_working
@@ -170,7 +181,20 @@ class LoggingEtsyMonitor:
                 return []
             
             if not all_shop_products:
-                self.log_sync("❌ Не удалось получить данные ни от одного магазина")
+                # Пустой результат бывает по двум разным причинам, и их
+                # важно не путать: магазины проверили и новинок нет, либо
+                # магазины проверить не удалось. «Новых товаров не найдено»
+                # во втором случае — враньё, поэтому помечаем флаг для финала.
+                if self.failed_shops == 0:
+                    self.log_sync(
+                        f"📭 Ни у одного из {self.checked_shops} магазинов нет новых товаров"
+                    )
+                else:
+                    # Сводную строку НЕ пишем с ❌: она попала бы в блок
+                    # проблем и завышала счётчик — проблем ровно failed_shops,
+                    # по одной на каждый магазин (они уже перечислены выше).
+                    if self.logger:
+                        self.logger.all_shops_failed = True
                 return []
             
             self.log_sync("🔍 Анализируем новые товары...")
@@ -253,22 +277,36 @@ class LoggingEtsyMonitor:
             try:
                 shop_name = self.monitor.parser.get_shop_name_from_url(url)
                 self.log_sync(f"🔄 [{i}/{len(urls)}] Парсим: {shop_name}")
-                
+
                 # Парсим магазин (только первую страницу)
-                products = self.monitor.parser.parse_shop_page(url)
-                
+                from parsers.base_parser import ShopCheckError
+                try:
+                    products = self.monitor.parser.parse_shop_page(url)
+                except ShopCheckError as e:
+                    # Магазин ПРОВЕРИТЬ не удалось — это проблема, а не пустота.
+                    self.failed_shops += 1
+                    self.failed_details.append((shop_name, url, str(e)))
+                    self.log_sync(f"❌ {shop_name}: не удалось проверить — {e}")
+                    continue
+
+                self.checked_shops += 1
+
                 if products:
                     all_shop_products[shop_name] = products
-                    
+
                     # Сохраняем данные
                     filename = self.monitor.data_service.save_products_to_excel(products, shop_name)
-                    
+
                     self.log_sync(f"✅ {shop_name}: {len(products)} товаров (первая страница)")
                 else:
-                    self.log_sync(f"⚠️ {shop_name}: не удалось получить товары")
-                
+                    # Магазин проверили успешно, просто новинок нет.
+                    # Это НЕ проблема — счётчик успешных шагов растёт.
+                    self.log_sync(f"✅ {shop_name}: новых товаров нет")
+
             except Exception as e:
                 shop_name = self.monitor.parser.get_shop_name_from_url(url) if url else "Unknown"
+                self.failed_shops += 1
+                self.failed_details.append((shop_name, url, str(e)[:80]))
                 self.log_sync(f"❌ Ошибка в {shop_name}: {str(e)[:50]}")
                 logging.error(f"Ошибка парсинга {url}: {e}")
         
@@ -502,7 +540,6 @@ class BotScheduler:
             # Без этого .monday.at("08:00") сработает в 08:00 ЛОКАЛЬНО,
             # что на сервере с TZ != Europe/Moscow ≠ 08:00 МСК.
             from utils.moscow_schedule import moscow_to_local_fire
-            local_day, local_hhmm = moscow_to_local_fire(schedule_time, schedule_day)
 
             day_mapping = {
                 "monday": schedule.every().monday,
@@ -514,50 +551,62 @@ class BotScheduler:
                 "sunday": schedule.every().sunday
             }
 
-            if local_day in day_mapping:
-                # Еженедельное расписание в локальном времени, соответствующее
-                # выбранному московскому HH:MM и дню недели.
+            # В БД может быть несколько дней через запятую: "monday,thursday".
+            # Старое значение "monday" разбирается так же.
+            days = [d.strip().lower() for d in str(schedule_day).split(',') if d.strip()]
+            if not days:
+                logging.error("Не выбран ни один день недели")
+                return
+
+            created = []
+            for day in days:
+                # Без конвертации .monday.at("08:00") сработает в 08:00 ЛОКАЛЬНО,
+                # что на сервере с TZ != Europe/Moscow ≠ 08:00 МСК.
+                local_day, local_hhmm = moscow_to_local_fire(schedule_time, day)
+
+                if local_day not in day_mapping:
+                    logging.error(f"Неизвестный день недели: {day}")
+                    continue
+
                 day_mapping[local_day].at(local_hhmm).do(self._schedule_job_wrapper)
+                created.append(f"{day} {local_hhmm}")
 
-                # Если сегодня тот же день и время еще не прошло — отдельная задача на сегодня.
-                if current_weekday == schedule_day:
-                    schedule_hour, schedule_minute = map(int, schedule_time.split(':'))
-                    schedule_datetime = moscow_time.replace(hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0)
+            if not created:
+                logging.error(f"Не удалось создать ни одной задачи по дням: {days}")
+                return
 
-                    if moscow_time < schedule_datetime:
-                        minutes_until = int((schedule_datetime - moscow_time).total_seconds() / 60)
+            logging.info(
+                f"Еженедельный запуск ({len(created)} дн.): "
+                f"{', '.join(days)} в {schedule_time} МСК (локально: {', '.join(created)})"
+            )
 
-                        # Та же конвертация для одноразовой задачи — иначе будет дрейф.
-                        _, today_local_hhmm = moscow_to_local_fire(schedule_time, schedule_day)
-                        schedule.every().day.at(today_local_hhmm).do(self._schedule_job_wrapper).tag('today')
+            # Одноразовая задача на сегодня — только одна, даже если выбрано
+            # несколько дней: иначе парсинг стартовал бы несколько раз подряд.
+            if current_weekday in days:
+                schedule_hour, schedule_minute = map(int, schedule_time.split(':'))
+                schedule_datetime = moscow_time.replace(
+                    hour=schedule_hour, minute=schedule_minute, second=0, microsecond=0
+                )
 
-                        logging.info(
-                            f"Запуск СЕГОДНЯ в {schedule_time} МСК "
-                            f"(через {minutes_until} мин, локально {today_local_hhmm}) "
-                            f"+ еженедельно {schedule_day} {schedule_time} МСК"
-                        )
-                    else:
-                        logging.info(
-                            f"Еженедельный запуск: каждый {schedule_day} в {schedule_time} МСК "
-                            f"(локально {local_day} {local_hhmm})"
-                        )
-                else:
+                if moscow_time < schedule_datetime:
+                    minutes_until = int((schedule_datetime - moscow_time).total_seconds() / 60)
+                    _, today_local_hhmm = moscow_to_local_fire(schedule_time, current_weekday)
+                    schedule.every().day.at(today_local_hhmm).do(self._schedule_job_wrapper).tag('today')
+
                     logging.info(
-                        f"Еженедельный запуск: каждый {schedule_day} в {schedule_time} МСК "
-                        f"(локально {local_day} {local_hhmm})"
+                        f"Запуск СЕГОДНЯ в {schedule_time} МСК "
+                        f"(через {minutes_until} мин, локально {today_local_hhmm}) "
+                        f"+ еженедельно: {', '.join(days)}"
                     )
 
-                logging.info(f"Текущее время МСК: {moscow_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logging.info(f"Текущее время МСК: {moscow_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-                if schedule.jobs:
-                    next_run = schedule.next_run()
-                    logging.info(f"Следующий запуск: {next_run}")
-            else:
-                logging.error(f"Неизвестный день недели: {schedule_day}")
+            if schedule.jobs:
+                logging.info(f"Следующий запуск: {schedule.next_run()}")
 
         except Exception as e:
             logging.error(f"Ошибка обновления расписания: {e}", exc_info=True)
-    
+
     def _scheduler_loop(self):
         """Основной цикл планировщика"""
         logging.info("Поток планировщика запущен")

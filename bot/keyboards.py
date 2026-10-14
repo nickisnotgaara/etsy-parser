@@ -42,25 +42,52 @@ def get_admin_menu() -> ReplyKeyboardMarkup:
     )
     return keyboard
 
-def get_days_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура выбора дня недели"""
-    days = [
-        ("Понедельник", "monday"),
-        ("Вторник", "tuesday"),
-        ("Среда", "wednesday"),
-        ("Четверг", "thursday"),
-        ("Пятница", "friday"),
-        ("Суббота", "saturday"),
-        ("Воскресенье", "sunday")
-    ]
-    
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=day_name, callback_data=f"day_{day_code}")]
-            for day_name, day_code in days
-        ]
-    )
-    return keyboard
+DAY_NAMES = [
+    ("Понедельник", "monday"),
+    ("Вторник", "tuesday"),
+    ("Среда", "wednesday"),
+    ("Четверг", "thursday"),
+    ("Пятница", "friday"),
+    ("Суббота", "saturday"),
+    ("Воскресенье", "sunday"),
+]
+
+# Пары заданы как (человеческое имя, код) — мапаем именно код → имя.
+# dict(DAY_NAMES) перевернул бы ключи и искал бы 'Понедельник' вместо 'monday'.
+DAY_NAMES_BY_CODE = {code: name for name, code in DAY_NAMES}
+
+
+def format_days(schedule_day: str) -> str:
+    """'monday,thursday' → 'Понедельник, Четверг'. Старое 'monday' работает."""
+    codes = [d.strip() for d in str(schedule_day).split(',') if d.strip()]
+    return ", ".join(DAY_NAMES_BY_CODE.get(code, code) for code in codes)
+
+
+def get_days_keyboard(selected_days=None) -> InlineKeyboardMarkup:
+    """Клавиатура выбора дней недели.
+
+    Выбрать можно несколько дней: нажатие переключает день (✓ отмечает
+    выбранный), а «Готово» завершает выбор. Раньше нажатие сразу уводило на
+    выбор времени, поэтому неделя могла быть только однодневной.
+    """
+    selected = set(selected_days or [])
+
+    rows = []
+    for day_name, day_code in DAY_NAMES:
+        mark = "✅ " if day_code in selected else ""
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{mark}{day_name}",
+                callback_data=f"day_{day_code}"
+            )
+        ])
+
+    if selected:
+        rows.append([
+            InlineKeyboardButton(text="✅ Готово", callback_data="days_done")
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_time_keyboard() -> InlineKeyboardMarkup:
     """Клавиатура выбора времени"""

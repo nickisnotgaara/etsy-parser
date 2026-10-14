@@ -9,6 +9,7 @@ from parsers.everbee_parser import EverBeeParser
 from services.data_service import DataService
 from services.tops_service import TopsService
 from models.product import Product
+from parsers.base_parser import ShopCheckError
 
 class EtsyMonitor:
     """Основной класс для мониторинга магазинов Etsy"""
@@ -88,9 +89,12 @@ class EtsyMonitor:
                         print(f"Пауза {self.config.etsy.request_delay} сек...")
                         time.sleep(self.config.etsy.request_delay)
                 else:
-                    print(f"⚠️ Магазин {shop_name} не удалось обработать, переходим к следующему")
+                    print(f"✅ Магазин {shop_name}: новых товаров нет")
                     i += 1
-                    
+
+            except ShopCheckError as e:
+                print(f"❌ Магазин {shop_name} не удалось проверить: {e}")
+                i += 1
             except Exception as e:
                 print(f"❌ Критическая ошибка при парсинге {url}: {e}")
                 print("🔄 Переходим к следующему магазину")

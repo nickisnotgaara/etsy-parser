@@ -3,7 +3,7 @@
 """
 import logging
 from typing import List, Optional
-from parsers.base_parser import BaseParser
+from parsers.base_parser import BaseParser, ShopCheckError
 from models.product import Product
 from utils.everbee_client import EverBeeClient
 
@@ -27,35 +27,42 @@ class EverBeeParser(BaseParser):
             return "unknown_shop"
     
     def parse_shop_page(self, shop_url: str) -> List[Product]:
-        """Парсит магазин через EverBee API с сортировкой по новизне"""
+        """Парсит магазин через EverBee API с сортировкой по новизне.
+
+        Возвращает [] если новых товаров нет.
+        Бросает ShopCheckError если магазин проверить не удалось — иначе в
+        логе невозможно отличить «новых нет» от «магазин не открылся».
+        """
         shop_name = self.get_shop_name_from_url(shop_url)
-        
+
         logging.info(f"📄 Парсим магазин через EverBee API: {shop_name}")
-        
+
         # Проверяем токен перед запросом
         if not self.everbee_client.ensure_token():
             logging.error(f"❌ Не удалось получить валидный токен для магазина {shop_name}")
-            return []
-        
+            raise ShopCheckError("токен EverBee не получен (проверьте логин/пароль)")
+
         # Получаем листинги отсортированные по возрасту (новые сначала)
         response = self.everbee_client.get_shop_listings(
             shop_name=shop_name,
             order_by="listing_age_in_months",
-            time_range="last_1_month", 
+            time_range="last_1_month",
             order_direction="asc",
             page=1,
             per_page=50
         )
-        
+
         if not response:
-            logging.error(f"❌ Не удалось получить данные для магазина {shop_name}")
-            return []
-        
+            reason = getattr(self.everbee_client, "last_error", None) or "EverBee не вернул данные"
+            logging.error(f"❌ Не удалось получить данные для магазина {shop_name}: {reason}")
+            raise ShopCheckError(reason)
+
         # Извлекаем листинги из ответа
         listings = response.get('results', [])
-        
+
         if not listings:
-            logging.info(f"⚠️ Нет листингов в магазине {shop_name}")
+            # Магазин проверили, просто за последний месяц новинок нет.
+            logging.info(f"✅ У магазина {shop_name} нет новых товаров за месяц")
             return []
         
         products = []

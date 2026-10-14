@@ -14,7 +14,7 @@ from bot.keyboards import (
     get_main_menu, get_settings_menu, get_admin_menu,
     get_days_keyboard, get_time_keyboard, get_back_keyboard,
     get_description_keyboard, get_admin_list_keyboard, get_confirm_delete_keyboard,
-    get_analytics_menu, get_analytics_settings_menu
+    get_analytics_menu, get_analytics_settings_menu, format_days
 )
 from services.analytics_service import AnalyticsService
 
@@ -81,29 +81,55 @@ async def schedule_setup(message: Message, state: FSMContext, db: BotDatabase):
     
     await message.answer(
         "📅 Настройка расписания парсинга\n\n"
-        "Выберите день недели для запуска парсинга:",
+        "Выберите дни недели для запуска парсинга.\n"
+        "Можно отметить несколько, например понедельник и четверг.",
         reply_markup=get_days_keyboard()
     )
     await state.set_state(ScheduleStates.waiting_for_day)
 
 @router.callback_query(F.data.startswith("day_"), StateFilter(ScheduleStates.waiting_for_day))
 async def process_day_selection(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора дня недели"""
+    """Переключение дня недели — можно выбрать несколько"""
     day = callback.data.split("_")[1]
-    await state.update_data(selected_day=day)
-    
-    day_names = {
-        "monday": "Понедельник",
-        "tuesday": "Вторник", 
-        "wednesday": "Среда",
-        "thursday": "Четверг",
-        "friday": "Пятница",
-        "saturday": "Суббота",
-        "sunday": "Воскресенье"
-    }
-    
+    data = await state.get_data()
+    selected = list(data.get("selected_days") or [])
+
+    if day in selected:
+        selected.remove(day)
+    else:
+        selected.append(day)
+
+    await state.update_data(selected_days=selected)
+
+    if not selected:
+        await callback.message.edit_text(
+            "📅 Выберите дни недели для запуска парсинга.\n\n"
+            "Можно отметить несколько — например, понедельник и четверг.",
+            reply_markup=get_days_keyboard()
+        )
+    else:
+        await callback.message.edit_text(
+            f"📅 Выбрано дней: {len(selected)} — {format_days(','.join(selected))}\n\n"
+            "Отметьте ещё дни или нажмите «✅ Готово».",
+            reply_markup=get_days_keyboard(selected)
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "days_done", StateFilter(ScheduleStates.waiting_for_day))
+async def process_days_done(callback: CallbackQuery, state: FSMContext):
+    """Выбор дней завершён — переходим к времени"""
+    data = await state.get_data()
+    selected = data.get("selected_days") or []
+
+    if not selected:
+        await callback.answer("Сначала выберите хотя бы один день", show_alert=True)
+        return
+
+    await state.update_data(selected_day=",".join(selected))
+
     await callback.message.edit_text(
-        f"📅 Выбран день: {day_names.get(day, day)}\n\n"
+        f"📅 Выбраны дни: {format_days(','.join(selected))}\n\n"
         "🕐 Теперь выберите время запуска:",
         reply_markup=get_time_keyboard()
     )
@@ -133,7 +159,7 @@ async def process_time_selection(callback: CallbackQuery, state: FSMContext, db:
     if success:
         await callback.message.edit_text(
             f"✅ Расписание успешно настроено!\n\n"
-            f"📅 День: {day_names.get(selected_day, selected_day)}\n"
+            f"📅 День: {format_days(selected_day)}\n"
             f"🕐 Время: {time}\n\n"
             f"🔄 Планировщик перезапускается..."
         )
@@ -144,7 +170,7 @@ async def process_time_selection(callback: CallbackQuery, state: FSMContext, db:
                 await scheduler.restart_scheduler()
                 await callback.message.edit_text(
                     f"✅ Расписание успешно настроено!\n\n"
-                    f"📅 День: {day_names.get(selected_day, selected_day)}\n"
+                    f"📅 День: {format_days(selected_day)}\n"
                     f"🕐 Время: {time}\n\n"
                     f"✅ Планировщик перезапущен."
                 )
@@ -222,7 +248,7 @@ async def current_settings(message: Message, db: BotDatabase):
     
     await message.answer(
         f"📋 Текущие настройки:\n\n"
-        f"📅 День: {day_names.get(schedule_day, schedule_day)}\n"
+        f"📅 День: {format_days(schedule_day)}\n"
         f"🕐 Время: {schedule_time}\n\n"
         f"⏰ Следующий запуск будет выполнен автоматически."
     )
@@ -497,7 +523,7 @@ async def statistics(message: Message, db: BotDatabase, scheduler=None):
     await message.answer(
         f"📊 Статистика:\n\n"
         f"👥 Администраторов: {len(await db.get_all_admins())}\n"
-        f"📅 Расписание: {day_names.get(schedule_day, schedule_day)} в {schedule_time}\n"
+        f"📅 Расписание: {format_days(schedule_day)} в {schedule_time}\n"
         f"⚙️ Статус парсера: {parser_status}"
     )
 
@@ -558,7 +584,7 @@ async def process_custom_time(message: Message, state: FSMContext, db: BotDataba
     if success:
         await message.answer(
             f"✅ Расписание успешно настроено!\n\n"
-            f"📅 День: {day_names.get(selected_day, selected_day)}\n"
+            f"📅 День: {format_days(selected_day)}\n"
             f"🕰️ Время: {formatted_time}\n\n"
             f"🔄 Планировщик перезапускается..."
         )
@@ -569,7 +595,7 @@ async def process_custom_time(message: Message, state: FSMContext, db: BotDataba
                 await scheduler.restart_scheduler()
                 await message.answer(
                     f"✅ Планировщик перезапущен!\n\n"
-                    f"🎆 Следующий запуск: {day_names.get(selected_day, selected_day)} в {formatted_time}",
+                    f"🎆 Следующий запуск: {format_days(selected_day)} в {formatted_time}",
                     reply_markup=get_main_menu()
                 )
             except Exception as e:
@@ -759,29 +785,55 @@ async def analytics_schedule_setup(message: Message, state: FSMContext, db: BotD
     
     await message.answer(
         "📅 Настройка расписания аналитики\n\n"
-        "Выберите день недели для запуска аналитики:",
+        "Выберите дни недели для запуска аналитики.\n"
+        "Можно отметить несколько.",
         reply_markup=get_days_keyboard()
     )
     await state.set_state(AnalyticsScheduleStates.waiting_for_day)
 
 @router.callback_query(F.data.startswith("day_"), StateFilter(AnalyticsScheduleStates.waiting_for_day))
 async def process_analytics_day_selection(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора дня недели для аналитики"""
+    """Переключение дня недели аналитики — можно выбрать несколько"""
     day = callback.data.split("_")[1]
-    await state.update_data(selected_day=day)
-    
-    day_names = {
-        "monday": "Понедельник",
-        "tuesday": "Вторник", 
-        "wednesday": "Среда",
-        "thursday": "Четверг",
-        "friday": "Пятница",
-        "saturday": "Суббота",
-        "sunday": "Воскресенье"
-    }
-    
+    data = await state.get_data()
+    selected = list(data.get("selected_days") or [])
+
+    if day in selected:
+        selected.remove(day)
+    else:
+        selected.append(day)
+
+    await state.update_data(selected_days=selected)
+
+    if not selected:
+        await callback.message.edit_text(
+            "📅 Выберите дни недели для запуска аналитики.\n\n"
+            "Можно отметить несколько.",
+            reply_markup=get_days_keyboard()
+        )
+    else:
+        await callback.message.edit_text(
+            f"📅 Выбрано дней: {len(selected)} — {format_days(','.join(selected))}\n\n"
+            "Отметьте ещё дни или нажмите «✅ Готово».",
+            reply_markup=get_days_keyboard(selected)
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "days_done", StateFilter(AnalyticsScheduleStates.waiting_for_day))
+async def process_analytics_days_done(callback: CallbackQuery, state: FSMContext):
+    """Выбор дней для аналитики завершён — переходим к времени"""
+    data = await state.get_data()
+    selected = data.get("selected_days") or []
+
+    if not selected:
+        await callback.answer("Сначала выберите хотя бы один день", show_alert=True)
+        return
+
+    await state.update_data(selected_day=",".join(selected))
+
     await callback.message.edit_text(
-        f"📅 Выбран день: {day_names.get(day, day)}\n\n"
+        f"📅 Выбраны дни: {format_days(','.join(selected))}\n\n"
         "🕐 Теперь выберите время запуска:",
         reply_markup=get_time_keyboard()
     )
@@ -810,7 +862,7 @@ async def process_analytics_time_selection(callback: CallbackQuery, state: FSMCo
     if success:
         await callback.message.edit_text(
             f"✅ Расписание аналитики успешно настроено!\n\n"
-            f"📅 День: {day_names.get(selected_day, selected_day)}\n"
+            f"📅 День: {format_days(selected_day)}\n"
             f"🕐 Время: {time}\n\n"
             f"🔄 Планировщик перезапускается..."
         )
@@ -821,7 +873,7 @@ async def process_analytics_time_selection(callback: CallbackQuery, state: FSMCo
                 await analytics_scheduler.restart_scheduler()
                 await callback.message.edit_text(
                     f"✅ Расписание аналитики успешно настроено!\n\n"
-                    f"📅 День: {day_names.get(selected_day, selected_day)}\n"
+                    f"📅 День: {format_days(selected_day)}\n"
                     f"🕐 Время: {time}\n\n"
                     f"✅ Планировщик перезапущен."
                 )
@@ -899,7 +951,7 @@ async def process_analytics_custom_time(message: Message, state: FSMContext, db:
     if success:
         await message.answer(
             f"✅ Расписание аналитики успешно настроено!\n\n"
-            f"📅 День: {day_names.get(selected_day, selected_day)}\n"
+            f"📅 День: {format_days(selected_day)}\n"
             f"🕰️ Время: {formatted_time}\n\n"
             f"🔄 Планировщик перезапускается..."
         )
@@ -910,7 +962,7 @@ async def process_analytics_custom_time(message: Message, state: FSMContext, db:
                 await analytics_scheduler.restart_scheduler()
                 await message.answer(
                     f"✅ Планировщик перезапущен!\n\n"
-                    f"🎆 Следующий запуск: {day_names.get(selected_day, selected_day)} в {formatted_time}",
+                    f"🎆 Следующий запуск: {format_days(selected_day)} в {formatted_time}",
                     reply_markup=get_analytics_menu()
                 )
             except Exception as e:
@@ -956,7 +1008,7 @@ async def current_analytics_settings(message: Message, db: BotDatabase):
     
     await message.answer(
         f"📋 Текущие настройки аналитики:\n\n"
-        f"📅 День: {day_names.get(schedule_day, schedule_day)}\n"
+        f"📅 День: {format_days(schedule_day)}\n"
         f"🕐 Время: {schedule_time}\n\n"
         f"⏰ Следующий запуск будет выполнен автоматически."
     )

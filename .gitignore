@@ -192,5 +192,7 @@ test_*.py
 *_test.py
 
 config-main.txt
+# Бэкапы/варианты конфига тоже содержат токен и пароли — под тем же риском.
+config-main.*.txt
 
 .amazonq

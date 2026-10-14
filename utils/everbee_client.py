@@ -29,6 +29,9 @@ class EverBeeClient:
         self.token = None
         self.username = None
         self.password = None
+        # Причина последней неудачи — нужна парсеру, чтобы в лог попало
+        # «почему не получилось», а не молчаливый отказ.
+        self.last_error = None
         self._load_config()
     
     def _load_config(self):
@@ -379,17 +382,44 @@ class EverBeeClient:
                     )
                 else:
                     logging.error("Не удалось обновить токен")
+                    self.last_error = f"токен EverBee истёк и не обновился"
                     return None
-            
+
             if response.status_code == 200:
+                self.last_error = None
                 return response.json()
             else:
                 logging.error(f"Ошибка получения листингов магазина {shop_name}: {response.status_code}")
+                self.last_error = self._describe_status(response)
                 return None
-                
+
         except Exception as e:
             logging.error(f"Ошибка запроса к EverBee для магазина {shop_name}: {e}")
+            self.last_error = f"сеть/таймаут: {e}"
             return None
+
+    @staticmethod
+    def _describe_status(response) -> str:
+        """Человеческое описание ответа EverBee — в лог идёт причина, а не код."""
+        code = response.status_code
+        reasons = {
+            401: "токен EverBee отклонён",
+            403: "доступ запрещён (403) — возможно, сработал лимит запросов",
+            404: "магазин не найден в EverBee (404) — возможно, переименован или удалён",
+            429: "превышен лимит запросов EverBee (429)",
+            500: "ошибка на стороне EverBee (500)",
+            502: "EverBee недоступен (502)",
+            503: "EverBee недоступен (503)",
+        }
+        detail = reasons.get(code, f"HTTP {code}")
+        try:
+            body = response.json()
+            message = body.get("message") or body.get("error")
+            if message:
+                detail = f"{detail}: {str(message)[:80]}"
+        except Exception:
+            pass
+        return detail
     
     def refresh_token(self) -> bool:
         """Принудительно обновляет токен"""

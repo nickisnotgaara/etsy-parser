@@ -146,7 +146,12 @@ class BotDatabase:
             return []
     
     async def update_scheduler_settings(self, schedule_time: str, schedule_day: str, updated_by: int) -> bool:
-        """Обновление настроек планировщика"""
+        """Обновление настроек планировщика.
+
+        ``schedule_day`` может содержать несколько дней через запятую:
+        ``"monday,thursday"`` — это два запуска в неделю. Старые значения
+        вида ``"monday"`` продолжают работать без изменений.
+        """
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 # Деактивируем старые настройки
@@ -178,7 +183,11 @@ class BotDatabase:
             return ("10:00", "monday")
     
     async def update_analytics_scheduler_settings(self, schedule_time: str, schedule_day: str, updated_by: int) -> bool:
-        """Обновление настроек планировщика аналитики"""
+        """Обновление настроек планировщика аналитики.
+
+        Как и у парсинга, ``schedule_day`` может содержать несколько дней
+        через запятую: ``"tuesday,friday"``.
+        """
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("UPDATE analytics_scheduler_settings SET is_active = 0")

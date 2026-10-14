@@ -66,6 +66,10 @@ class ParsingLogger:
         self.current_shop = 0
         self.new_products = 0
         self.stopped = False
+        # Ставится монитором, когда НИ ОДИН магазин не удалось проверить.
+        # Иначе финал «новых товаров не найдено» — просто враньё.
+        self.all_shops_failed = False
+        self.failed_shops_details = []  # (магазин, url, причина)
 
         self._dirty = False
         self._shown_errors = 0
@@ -122,6 +126,10 @@ class ParsingLogger:
         self.total_shops = total
         self.current_shop = 0
         self._dirty = True
+
+    def set_failed_shops(self, details):
+        """Список (магазин, url, причина) для отдельного сообщения с ошибками."""
+        self.failed_shops_details = list(details or [])
 
     # ----------------------------------------------------------------- events
 
@@ -255,7 +263,7 @@ class ParsingLogger:
             lines.append(f"⚠️ <b>Проблемы ({total_errors})</b>")
             lines += [f"• {_esc(error)}" for error in shown]
             if hidden > 0:
-                lines.append(f"• …и ещё {hidden} — в сообщении ниже")
+                lines.append(f"• …и ещё {hidden} — полный список ниже отдельным сообщением")
             lines.append("")
         else:
             lines += ["✅ Проблем нет", ""]
@@ -307,6 +315,11 @@ class ParsingLogger:
 
         if failed:
             self._final_line = "❌ <b>Парсинг завершился с ошибкой</b>"
+        elif self.all_shops_failed:
+            self._final_line = (
+                "❌ <b>Не удалось проверить ни одного магазина</b> — "
+                "список проблем выше"
+            )
         elif total_new_products > 0:
             self._final_line = (
                 f"✅ <b>Парсинг завершён!</b> Найдено {total_new_products} "
@@ -322,48 +335,66 @@ class ParsingLogger:
         # Финальный статус обязан быть виден: обновление здесь принудительное.
         if self.log_messages:
             await self._update_message()
-            await self._send_remaining_problems()
+            await self._send_error_report()
 
-    async def _send_remaining_problems(self):
-        """Отправляет проблемы, которые не влезли в основное сообщение.
+    def _error_report_lines(self) -> List[str]:
+        """Строки отдельного отчёта: сломанные магазины со ссылками."""
+        lines = []
+        listed = set()
 
-        Ограничение Telegram — 4096 символов на сообщение. Основное сообщение
-        лога заполняется по этому бюджету, и если проблем больше, чем в него
-        поместилось, недостающие уходят отдельными сообщениями. Иначе часть
-        магазинов с проблемами была бы не видна вообще — ровно то, что
-        чинили.
+        for shop, url, reason in self.failed_shops_details:
+            if shop in listed:
+                continue
+            listed.add(shop)
+            name = f'<a href="{url}">{_esc(shop)}</a>' if url else _esc(shop)
+            lines.append(f"• {name} — {_esc(reason)}")
+
+        # Ошибки, не привязанные к конкретному магазину (сбой цикла, стоп и т.п.)
+        for entry in self.errors:
+            if any(shop in entry for shop in listed):
+                continue
+            lines.append(f"• {_esc(entry)}")
+            listed.add(entry)
+
+        return lines
+
+    async def _send_error_report(self):
+        """Отдельное сообщение со списком проблемных магазинов.
+
+        Лог живёт в одном сообщении и показывает срез; полный список с
+        кликабельными ссылками на магазины уходит отдельным сообщением —
+        его удобно пролистать и потом вручную открыть каждый магазин.
         """
-        if not self.log_messages:
-            return
-
-        shown = getattr(self, "_shown_count", 0)
-        remaining = self.errors[: len(self.errors) - shown] if shown else list(self.errors)
-        if not remaining:
+        lines = self._error_report_lines()
+        if not lines or not self.log_messages:
             return
 
         chunks = []
         current = []
         used = 0
-        # Заголовок с местом под номер: закладываем 60 символов.
-        for error in remaining:
-            cost = len(_esc(error)) + 3
-            if used + cost > self.max_message_length - 60:
+        # Запас под заголовок и подвал.
+        for line in lines:
+            cost = len(line) + 3
+            if used + cost > self.max_message_length - 300:
                 chunks.append(current)
                 current, used = [], 0
-            current.append(error)
+            current.append(line)
             used += cost
         if current:
             chunks.append(current)
 
+        total = len(lines)
         for index, chunk in enumerate(chunks, 1):
-            header = (
-                f"⚠️ <b>Проблемы — продолжение "
-                f"({index}/{len(chunks)})</b>\n\n"
-                f"В основном логе показаны последние {shown}. "
-                f"Здесь первые {len(remaining)}."
+            header = f"🚫 <b>Магазины с ошибками ({total})</b>"
+            if len(chunks) > 1:
+                header += f" — часть {index}/{len(chunks)}"
+            body = "\n".join(chunk)
+            text = (
+                f"{header}\n\n"
+                f"Проверить эти магазины вручную не получилось — "
+                f"список один на весь прогон.\n\n{body}\n\n"
+                f"ℹ️ Это итоговый список, не срез лога."
             )
-            body = "\n".join(f"• {_esc(error)}" for error in chunk)
-            text = f"{header}\n\n{body}"
 
             for recipient in self.recipients:
                 try:
@@ -372,9 +403,9 @@ class ParsingLogger:
                     )
                 except Exception as e:
                     logging.error(
-                        f"Не удалось отправить продолжение лога {recipient}: {e}"
+                        f"Не удалось отправить список магазинов с ошибками {recipient}: {e}"
                     )
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.4)
 
 class NotificationService:
     """Сервис для отправки уведомлений о новых товарах"""
